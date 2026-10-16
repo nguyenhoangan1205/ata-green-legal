@@ -26,10 +26,36 @@ except ImportError:
     messagebox.showerror("FB Auto Poster", "Chưa cài thư viện. Hãy chạy file 'Cai dat lan dau.bat' trước.")
     sys.exit(1)
 
-try:
-    import fb_graph_api as fbapi
-except ImportError:   # thiếu thư viện requests -> tab API báo cách cài
-    fbapi = None
+import importlib
+import subprocess
+
+fbapi, FBAPI_ERROR = None, ""
+
+
+def load_fbapi():
+    """Nạp module Graph API; lỗi thì ghi lại để tab API báo đúng nguyên nhân."""
+    global fbapi, FBAPI_ERROR
+    if not os.path.exists(os.path.join(APP_DIR, "fb_graph_api.py")):
+        FBAPI_ERROR = "missing_file"
+        return
+    try:
+        importlib.invalidate_caches()
+        fbapi = importlib.import_module("fb_graph_api")
+        FBAPI_ERROR = ""
+    except ModuleNotFoundError as e:
+        FBAPI_ERROR = "missing_requests" if e.name == "requests" else f"{e}"
+    except Exception as e:
+        FBAPI_ERROR = f"{type(e).__name__}: {e}"
+
+
+def python_exe():
+    """python.exe cùng bộ với pythonw.exe đang chạy app (để pip cài đúng chỗ)."""
+    exe = sys.executable
+    alt = os.path.join(os.path.dirname(exe), "python.exe")
+    return alt if exe.lower().endswith("pythonw.exe") and os.path.exists(alt) else exe
+
+
+load_fbapi()
 
 ICON = {"queue": "⏸", "run": "⏳", "posted": "✅", "pending": "🕓", "skipped": "⏭", "error": "❌", "stopped": "■"}
 RETRY_STATES = ("error", "skipped", "stopped", "queue", "run")
@@ -785,14 +811,49 @@ class App:
 
     def need_api(self):
         if fbapi is None:
-            messagebox.showerror("Đăng Trang bằng API", "Thiếu thư viện 'requests'.\n"
-                                 "Mở Command Prompt và chạy:  pip install requests\nrồi mở lại app.")
+            load_fbapi()   # có thể vừa chép file / cài thư viện xong
+        if fbapi is None:
+            if FBAPI_ERROR == "missing_file":
+                messagebox.showerror("Đăng Trang bằng API", "Không tìm thấy file fb_graph_api.py trong thư mục app:\n"
+                                     f"{APP_DIR}\n\nChép file vào đúng thư mục này. Nếu khi tải về tên bị đổi "
+                                     "(vd. 'fb_graph_api (1).py' hoặc '.py.txt') thì đổi lại đúng tên fb_graph_api.py.")
+            elif FBAPI_ERROR == "missing_requests":
+                if messagebox.askyesno("Đăng Trang bằng API", "Máy chưa có thư viện 'requests' (cần để gọi API Facebook).\n"
+                                       "Cài tự động ngay bây giờ? (mất khoảng 10–30 giây, cần mạng)"):
+                    self.install_requests()
+            else:
+                messagebox.showerror("Đăng Trang bằng API", f"Không nạp được fb_graph_api.py:\n{FBAPI_ERROR}")
             return False
         if not self.api_token.get().strip():
             if messagebox.askyesno("Chưa có token", "Chưa dán Access token. Mở trang lấy token ngay?"):
                 webbrowser.open(fbapi.TOKEN_URL)
             return False
         return True
+
+    def install_requests(self):
+        self.status.config(text="Đang cài thư viện requests…")
+        self.api_scan_btn.config(state="disabled")
+
+        def work():
+            try:
+                r = subprocess.run([python_exe(), "-m", "pip", "install", "requests"], capture_output=True, text=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                ok, out = r.returncode == 0, (r.stderr or r.stdout)[-600:]
+            except Exception as e:
+                ok, out = False, str(e)
+            self.root.after(0, lambda: self.after_install(ok, out))
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_install(self, ok, out):
+        self.api_scan_btn.config(state="normal")
+        load_fbapi()
+        if ok and fbapi:
+            self.status.config(text="Đã cài xong requests")
+            messagebox.showinfo("Đăng Trang bằng API", "Đã cài xong. Giờ có thể quét trang và đăng bằng API.")
+        else:
+            self.status.config(text="Cài requests bị lỗi")
+            messagebox.showerror("Đăng Trang bằng API", "Cài tự động không được. Mở Command Prompt và chạy:\n\n"
+                                 f'"{python_exe()}" -m pip install requests\n\nChi tiết lỗi:\n{out}')
 
     def api_scan(self):
         if self.busy or not self.need_api():

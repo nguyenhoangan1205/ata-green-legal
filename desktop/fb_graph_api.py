@@ -1,12 +1,19 @@
 """Gọi Facebook Graph API để quét và đăng bài lên các Trang mình quản lý.
 
 Dùng cho tab "Đăng Trang bằng API" của FB Auto Poster. Cần: pip install requests
+Bấm đúp file này để tự kiểm tra (thư viện, kết nối tới Facebook, token).
 """
 import json
 import os
+import sys
 import time
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:
+    if __name__ != "__main__":
+        raise
+    requests = None  # chế độ tự kiểm tra sẽ báo thiếu
 
 GRAPH_VERSION = "v23.0"
 GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
@@ -139,3 +146,42 @@ def post_to_page(page, message, media_paths=(), link="", stop=None):
         raise GraphError("Bài đăng trống: chưa có nội dung, link hay ảnh/video")
     r = _check(requests.post(f"{GRAPH}/{page_id}/feed", data=data, timeout=60))
     return r.get("id", ""), "Đã đăng"
+
+
+def self_check():
+    """Bấm đúp file này: kiểm tra thư viện, mạng và token rồi báo kết quả."""
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    root = tk.Tk()
+    root.withdraw()
+    title = "Kiểm tra fb_graph_api"
+    lines = [f"Python: {sys.executable}"]
+    if requests is None:
+        exe = sys.executable.replace("pythonw.exe", "python.exe")
+        messagebox.showerror(title, "\n".join(lines) + "\n\n❌ Chưa cài thư viện requests.\n"
+                             f'Mở Command Prompt và chạy:\n"{exe}" -m pip install requests')
+        return
+    lines.append(f"✅ Thư viện requests {requests.__version__}")
+    try:
+        requests.get(f"{GRAPH}/me", timeout=15)   # không token -> Facebook trả lỗi JSON, vậy là kết nối được
+        lines.append("✅ Kết nối được tới graph.facebook.com")
+    except Exception as e:
+        messagebox.showerror(title, "\n".join(lines) + f"\n\n❌ Không kết nối được Facebook: {e}")
+        return
+    token = simpledialog.askstring(title, "\n".join(lines) + "\n\nDán User Access Token để thử quét trang "
+                                   "(bỏ trống rồi OK để bỏ qua):", parent=root)
+    if token and token.strip():
+        try:
+            me = get_me(token.strip())
+            pages = list_pages(token.strip())
+            lines.append(f"✅ Token của: {me.get('name')} — quản lý {len(pages)} trang")
+            lines += [f"   • {p['name']} ({p['id']})" for p in pages[:15]]
+        except Exception as e:
+            lines.append(f"❌ Token lỗi: {e}")
+    messagebox.showinfo(title, "\n".join(lines) + "\n\nFile này là thư viện của app, không phải app riêng. "
+                        "Mở FB Auto Poster rồi vào tab '🔑 Đăng Trang bằng API' để dùng.")
+
+
+if __name__ == "__main__":
+    self_check()
