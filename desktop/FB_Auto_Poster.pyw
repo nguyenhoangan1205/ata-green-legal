@@ -3,10 +3,13 @@ Mở bằng file "Mo FB Auto Poster.bat" (hoặc nhấp đúp file này)."""
 import json
 import os
 import queue
+import random
 import re
 import sys
+import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import ttk, filedialog, messagebox
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -23,8 +26,14 @@ except ImportError:
     messagebox.showerror("FB Auto Poster", "Chưa cài thư viện. Hãy chạy file 'Cai dat lan dau.bat' trước.")
     sys.exit(1)
 
+try:
+    import fb_graph_api as fbapi
+except ImportError:   # thiếu thư viện requests -> tab API báo cách cài
+    fbapi = None
+
 ICON = {"queue": "⏸", "run": "⏳", "posted": "✅", "pending": "🕓", "skipped": "⏭", "error": "❌", "stopped": "■"}
 RETRY_STATES = ("error", "skipped", "stopped", "queue", "run")
+URL_RE = re.compile(r"https://\S+")
 ON, OFF = "☑", "☐"
 
 
@@ -81,6 +90,9 @@ class App:
         self.history = load_json(HISTORY, [])   # các phiên đăng, mới nhất ở cuối
         self.session = None    # phiên đang chạy / vừa chạy
         self.busy = False
+        self.api_pages = []    # [{id, name, link, checked}]  — Trang quét bằng Graph API (lưu lại)
+        self.api_events = queue.Queue()
+        self.api_stop = threading.Event()
         self.engine = Engine(os.path.join(os.environ.get("LOCALAPPDATA", DATA_DIR), "FBAutoPoster", "browser-profile-chrome"))
         self.engine.start()
         self.build()
@@ -124,12 +136,17 @@ class App:
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=10)
         post_tab = ttk.Frame(self.nb, padding=8)
+        api_tab = ttk.Frame(self.nb, padding=8)
         hist_tab = ttk.Frame(self.nb, padding=8)
         self.nb.add(post_tab, text="  ✍  Đăng bài  ")
+        self.nb.add(api_tab, text="  🔑  Đăng Trang bằng API  ")
         self.nb.add(hist_tab, text="  🕘  Lịch sử phiên đăng  ")
-        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.render_history() if self.nb.index("current") == 1 else None)
+        self.api_tab, self.hist_tab = str(api_tab), str(hist_tab)
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self.on_tab_changed())
         self.build_post_tab(post_tab)
+        self.build_api_tab(api_tab)
         self.build_history_tab(hist_tab)
+        self.paint_main_btn(False)
         ttk.Frame(self.root, height=8).pack(fill="x")
 
     def build_post_tab(self, tab):
@@ -245,6 +262,96 @@ class App:
         sb.pack(side="right", fill="y")
         return tree
 
+    def build_api_tab(self, tab):
+        tab.columnconfigure(0, weight=6, uniform="a")
+        tab.columnconfigure(1, weight=5, uniform="a")
+        tab.rowconfigure(1, weight=1)
+
+        # ---- 1. Token ----
+        f = ttk.LabelFrame(tab, text=" 1. Access token Facebook (User token) ", padding=6)
+        f.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        f.columnconfigure(2, weight=1)
+        ttk.Button(f, text="🔗 Mở link lấy token", command=lambda: webbrowser.open(fbapi.TOKEN_URL if fbapi else
+                   "https://developers.facebook.com/tools/explorer/")).grid(row=0, column=0)
+        ttk.Button(f, text="🔎 Kiểm tra / gia hạn token", command=lambda: webbrowser.open(
+            "https://developers.facebook.com/tools/debug/accesstoken/")).grid(row=0, column=1, padx=6)
+        self.api_token = tk.StringVar()
+        self.api_token_entry = ttk.Entry(f, textvariable=self.api_token, show="•")
+        self.api_token_entry.grid(row=0, column=2, sticky="ew")
+        self.api_show = tk.BooleanVar()
+        ttk.Checkbutton(f, text="Hiện", variable=self.api_show, command=lambda: self.api_token_entry.config(
+            show="" if self.api_show.get() else "•")).grid(row=0, column=3, padx=(6, 0))
+        self.api_remember = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f, text="Nhớ token", variable=self.api_remember).grid(row=0, column=4, padx=6)
+        self.api_scan_btn = ttk.Button(f, text="🔍 Quét trang bằng API", command=self.api_scan)
+        self.api_scan_btn.grid(row=0, column=5)
+        ttk.Label(f, foreground="#65676b", text=(
+            "Cách lấy token: bấm 'Mở link lấy token' → chọn app → Get User Access Token → tick quyền "
+            "pages_show_list, pages_read_engagement, pages_manage_posts → Generate (chọn các trang) → copy dán vào ô trên."
+            "\nToken từ Explorer chỉ sống ~1–2 giờ: bấm 'Kiểm tra / gia hạn token' → Extend Access Token để dùng ~60 ngày.")
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
+
+        # ---- 2. Danh sách Trang ----
+        f = ttk.LabelFrame(tab, text=" 2. Trang tôi quản lý (tick ☑ để chọn) ", padding=6)
+        f.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
+        bar = ttk.Frame(f)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="☑ Chọn tất cả", command=lambda: self.api_check_all(True)).pack(side="left")
+        ttk.Button(bar, text="☐ Bỏ chọn tất cả", command=lambda: self.api_check_all(False)).pack(side="left", padx=6)
+        self.api_who = ttk.Label(bar, foreground="#31a24c", font=("Segoe UI", 10, "bold"))
+        self.api_who.pack(side="right")
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True, pady=(6, 0))
+        self.api_ptree = ttk.Treeview(wrap, columns=("c", "name", "id", "url"), show="headings", selectmode="extended")
+        for c, t, w in (("c", "✔", 36), ("name", "Tên trang", 230), ("id", "Page ID", 140), ("url", "Link", 180)):
+            self.api_ptree.heading(c, text=t)
+            self.api_ptree.column(c, width=w, stretch=c in ("name", "url"), anchor="center" if c == "c" else "w")
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=self.api_ptree.yview)
+        self.api_ptree.configure(yscrollcommand=sb.set)
+        self.api_ptree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.api_ptree.bind("<Button-1>", self.on_api_page_click)
+        self.api_ptree.bind("<space>", lambda e: self.api_toggle_selected())
+        self.api_pcount = ttk.Label(f, foreground="#65676b")
+        self.api_pcount.pack(anchor="w")
+
+        # ---- 3. Nội dung + đăng ----
+        right = ttk.Frame(tab)
+        right.grid(row=1, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        f = ttk.LabelFrame(right, text=" 3. Nội dung & đăng ", padding=6)
+        f.grid(row=0, column=0, sticky="ew")
+        self.api_content = ttk.Label(f, foreground="#1c1e21", wraplength=480, justify="left")
+        self.api_content.pack(anchor="w")
+        ttk.Button(f, text="✍ Sửa nội dung / ảnh / video (tab Đăng bài)", command=lambda: self.nb.select(0)
+                   ).pack(anchor="w", pady=(4, 6))
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        ttk.Label(row, text="Link kèm bài (tuỳ chọn):").pack(side="left")
+        self.api_link = tk.StringVar()
+        ttk.Entry(row, textvariable=self.api_link).pack(side="left", fill="x", expand=True, padx=4)
+        row = ttk.Frame(f)
+        row.pack(fill="x", pady=6)
+        ttk.Label(row, text="Nghỉ giữa 2 trang từ").pack(side="left")
+        ttk.Spinbox(row, from_=10, to=3600, width=6, textvariable=self.dmin).pack(side="left", padx=4)
+        ttk.Label(row, text="đến").pack(side="left")
+        ttk.Spinbox(row, from_=10, to=3600, width=6, textvariable=self.dmax).pack(side="left", padx=4)
+        ttk.Label(row, text="giây").pack(side="left")
+        self.api_btn = tk.Button(f, command=self.toggle_api_run, font=("Segoe UI", 12, "bold"), relief="flat",
+                                 cursor="hand2", padx=18, pady=6, bd=0, disabledforeground="#e4e6eb")
+        self.api_btn.pack(fill="x")
+        ttk.Label(f, foreground="#65676b", wraplength=480, justify="left", text=(
+            "Nhiều ảnh → 1 bài album. Có video → đăng 1 video/bài (API không cho trộn ảnh + video)."
+        )).pack(anchor="w", pady=(4, 0))
+
+        f = ttk.LabelFrame(right, text=" Kết quả (bấm đúp để mở bài) ", padding=6)
+        f.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.api_rtree = self.make_result_tree(f)
+        self.api_rtree.bind("<Double-1>", self.open_result_link)
+        self.api_summary = ttk.Label(f, foreground="#65676b")
+        self.api_summary.pack(anchor="w")
+
     def build_history_tab(self, tab):
         tab.columnconfigure(0, weight=1)
         tab.rowconfigure(0, weight=2)
@@ -294,7 +401,10 @@ class App:
 
     def save(self):
         cfg = {"text": self.get_text(), "media": self.media, "targets": self.targets,
-               "dmin": self.safe_int(self.dmin, 20), "dmax": self.safe_int(self.dmax, 20), "auto": self.auto.get()}
+               "dmin": self.safe_int(self.dmin, 20), "dmax": self.safe_int(self.dmax, 20), "auto": self.auto.get(),
+               "api_token": self.api_token.get().strip() if self.api_remember.get() else "",
+               "api_remember": self.api_remember.get(), "api_link": self.api_link.get().strip(),
+               "api_pages": self.api_pages}
         save_json(CONFIG, cfg)
 
     def save_history(self):
@@ -315,6 +425,11 @@ class App:
         self.dmin.set(cfg.get("dmin", 20))
         self.dmax.set(cfg.get("dmax", 20))
         self.auto.set(cfg.get("auto", False))
+        self.api_token.set(cfg.get("api_token", ""))
+        self.api_remember.set(cfg.get("api_remember", True))
+        self.api_link.set(cfg.get("api_link", ""))
+        self.api_pages = cfg.get("api_pages", [])
+        self.render_api_pages()
         self.chars.config(text=f"{len(self.get_text())} ký tự")
         self.render_media()
         self.render_targets()
@@ -495,13 +610,20 @@ class App:
     def set_busy(self, on):
         self.busy = on
         s = "disabled" if on else "normal"
-        for b in self.scan_btns + self.hbtns:
+        for b in self.scan_btns + self.hbtns + [self.api_scan_btn]:
             b.config(state=s)
         self.paint_main_btn(on)
         has_err = bool(self.session) and any(r["status"] in RETRY_STATES for r in self.session["results"])
         self.retry_btn.config(state="normal" if (not on and has_err) else "disabled")
 
     def paint_main_btn(self, running):
+        if hasattr(self, "api_btn"):
+            if running:
+                self.api_btn.config(text="■  DỪNG", bg="#e41e3f", activebackground="#c9172f", fg="white",
+                                    activeforeground="white", state="normal")
+            else:
+                self.api_btn.config(text="▶  ĐĂNG BẰNG API LÊN CÁC TRANG ĐÃ CHỌN", bg="#1877f2",
+                                    activebackground="#166fe5", fg="white", activeforeground="white", state="normal")
         if running:
             self.start_btn.config(text="■  DỪNG", bg="#e41e3f", activebackground="#c9172f", fg="white",
                                   activeforeground="white", state="normal")
@@ -512,9 +634,16 @@ class App:
     def toggle_run(self):
         if self.busy:
             self.stop()
-            self.start_btn.config(text="⏳  Đang dừng…", state="disabled", bg="#8a8d91")
+            for b in (self.start_btn, self.api_btn):
+                b.config(text="⏳  Đang dừng…", state="disabled", bg="#8a8d91")
         else:
             self.start()
+
+    def toggle_api_run(self):
+        if self.busy:
+            self.toggle_run()
+        else:
+            self.api_start()
 
     def open_browser(self):
         self.status.config(text="Đang mở Chrome…")
@@ -535,7 +664,13 @@ class App:
     def retry_current(self):
         s = self.session
         if s:
-            self.run([r for r in s["results"] if r["status"] in RETRY_STATES], s["text"], s["media"])
+            self.rerun(s, [r for r in s["results"] if r["status"] in RETRY_STATES])
+
+    def rerun(self, s, results):
+        if s.get("api"):
+            self.run_api(results, s["text"], s["media"], s.get("link", ""))
+        else:
+            self.run(results, s["text"], s["media"])
 
     def run(self, targets, text, media):
         media_ok = [m for m in media if os.path.exists(m)]
@@ -567,6 +702,7 @@ class App:
 
     def stop(self):
         self.engine.stop()
+        self.api_stop.set()
         self.status.config(text="Đang dừng…")
 
     @staticmethod
@@ -585,6 +721,191 @@ class App:
         self.fill_result_tree(self.rtree, res)
         ok, pend, bad = self.count(res)
         self.summary.config(text=f"✅ {ok} · 🕓 {pend} · ❌/⏭ {bad} / {len(res)}" if res else "")
+        api_res = res if self.session and self.session.get("api") else []
+        self.fill_result_tree(self.api_rtree, api_res)
+        self.api_summary.config(text=f"✅ {ok} · ❌ {bad} / {len(api_res)}" if api_res else "")
+
+    # ---------- Đăng Trang bằng API ----------
+    def on_tab_changed(self):
+        cur = self.nb.select()
+        if cur == self.hist_tab:
+            self.render_history()
+        elif cur == self.api_tab:
+            self.render_api_content()
+
+    def render_api_content(self):
+        text = " ".join(self.get_text().split())
+        media = [m for m in self.media if os.path.exists(m)]
+        nv = sum(map(is_video, media))
+        self.api_content.config(text=(
+            f"Nội dung lấy từ tab Đăng bài: {len(self.get_text())} ký tự · {len(media) - nv} ảnh · {nv} video\n"
+            f"“{text[:160]}{'…' if len(text) > 160 else ''}”" if text or media
+            else "Chưa có nội dung — soạn ở tab ✍ Đăng bài."))
+
+    def render_api_pages(self):
+        self.api_ptree.delete(*self.api_ptree.get_children())
+        for p in self.api_pages:
+            self.api_ptree.insert("", "end", iid=p["id"], values=(ON if p["checked"] else OFF, p["name"], p["id"],
+                                                                  short(p["link"])))
+        n = sum(p["checked"] for p in self.api_pages)
+        self.api_pcount.config(text=f"Đã chọn {n}/{len(self.api_pages)} trang" if self.api_pages else
+                               "Chưa có trang — dán token rồi bấm 'Quét trang bằng API'")
+
+    def find_api_page(self, pid):
+        return next((p for p in self.api_pages if p["id"] == pid), None)
+
+    def on_api_page_click(self, e):
+        if self.api_ptree.identify_region(e.x, e.y) == "heading":
+            if self.api_ptree.identify_column(e.x) == "#1":
+                self.api_check_all(not all(p["checked"] for p in self.api_pages))
+            return
+        iid = self.api_ptree.identify_row(e.y)
+        if iid and self.api_ptree.identify_column(e.x) == "#1":
+            p = self.find_api_page(iid)
+            p["checked"] = not p["checked"]
+            self.render_api_pages()
+            self.save()
+            return "break"
+
+    def api_toggle_selected(self):
+        sel = [self.find_api_page(i) for i in self.api_ptree.selection()]
+        if sel:
+            v = not all(p["checked"] for p in sel)
+            for p in sel:
+                p["checked"] = v
+            self.render_api_pages()
+            self.save()
+        return "break"
+
+    def api_check_all(self, v):
+        for p in self.api_pages:
+            p["checked"] = v
+        self.render_api_pages()
+        self.save()
+
+    def need_api(self):
+        if fbapi is None:
+            messagebox.showerror("Đăng Trang bằng API", "Thiếu thư viện 'requests'.\n"
+                                 "Mở Command Prompt và chạy:  pip install requests\nrồi mở lại app.")
+            return False
+        if not self.api_token.get().strip():
+            if messagebox.askyesno("Chưa có token", "Chưa dán Access token. Mở trang lấy token ngay?"):
+                webbrowser.open(fbapi.TOKEN_URL)
+            return False
+        return True
+
+    def api_scan(self):
+        if self.busy or not self.need_api():
+            return
+        token = self.api_token.get().strip()
+        self.save()
+        self.api_scan_btn.config(state="disabled")
+        self.status.config(text="Đang quét trang bằng API…")
+
+        def work():
+            try:
+                me = fbapi.get_me(token)
+                pages = fbapi.list_pages(token)
+            except Exception as e:
+                self.api_events.put(("api_scan_error", str(e)))
+                return
+            self.api_events.put(("api_scan", me.get("name", ""), pages))
+        threading.Thread(target=work, daemon=True).start()
+
+    def api_merge_scan(self, who, pages):
+        self.api_scan_btn.config(state="normal")
+        old = {p["id"]: p["checked"] for p in self.api_pages}
+        self.api_pages = [{"id": p["id"], "name": p["name"], "link": p["link"], "checked": old.get(p["id"], False)}
+                          for p in pages]
+        new = sum(p["id"] not in old for p in pages)
+        self.api_who.config(text=f"Token của: {who}" if who else "")
+        self.render_api_pages()
+        self.save()
+        self.status.config(text=f"API: quét được {len(pages)} trang ({new} mới)")
+        if not pages:
+            messagebox.showinfo("Quét trang bằng API", "Token này không quản lý trang nào.\nKhi bấm Generate token, "
+                                "nhớ chọn các trang muốn cho phép đăng.")
+
+    def api_start(self):
+        chosen = [{"url": p["link"], "name": p["name"], "page_id": p["id"]} for p in self.api_pages if p["checked"]]
+        if not chosen:
+            return messagebox.showwarning("Đăng Trang bằng API", "Chưa tick chọn trang nào.")
+        self.run_api(chosen, self.get_text(), list(self.media), self.api_link.get().strip())
+
+    def run_api(self, targets, text, media, link=""):
+        if self.busy or not self.need_api():
+            return
+        media_ok = [m for m in media if os.path.exists(m)]
+        if not text.strip() and not media_ok and not link:
+            return messagebox.showwarning("Đăng Trang bằng API", "Chưa có nội dung, link hoặc ảnh/video.")
+        if not targets:
+            return messagebox.showwarning("Đăng Trang bằng API", "Không có trang nào để đăng.")
+        if len(media_ok) < len(media) and not messagebox.askyesno(
+                "Thiếu file", f"{len(media) - len(media_ok)} ảnh/video không còn trên máy. Vẫn đăng phần còn lại?"):
+            return
+        nv = sum(map(is_video, media_ok))
+        if nv and (nv > 1 or len(media_ok) > nv or link) and not messagebox.askyesno(
+                "Bài video", "Qua API, bài video chỉ đăng được 1 video, không kèm ảnh/link.\n"
+                             "App sẽ đăng video đầu tiên và bỏ qua phần còn lại. Tiếp tục?"):
+            return
+        if not messagebox.askyesno("Xác nhận", f"Đăng bằng API lên {len(targets)} trang ngay (không duyệt tay)?"):
+            return
+        dmin = max(10, self.safe_int(self.dmin, 20))
+        dmax = max(dmin, self.safe_int(self.dmax, 20))
+        self.save()
+        self.session = {
+            "id": time.strftime("%Y%m%d-%H%M%S"), "start": time.strftime("%d/%m/%Y %H:%M"), "end": None,
+            "text": text, "media": media_ok, "auto": True, "api": True, "link": link,
+            "results": [{"url": t["url"], "name": t.get("name", ""), "page_id": t.get("page_id") or t.get("id"),
+                         "status": "queue", "msg": ""} for t in targets],
+        }
+        self.history.append(self.session)
+        self.save_history()
+        self.render_results()
+        self.set_busy(True)
+        self.api_stop.clear()
+        jobs = [(i, r["page_id"]) for i, r in enumerate(self.session["results"])]
+        threading.Thread(target=self.api_worker, daemon=True,
+                         args=(self.api_token.get().strip(), jobs, text, media_ok, link, dmin, dmax)).start()
+
+    def api_worker(self, token, jobs, text, media, link, dmin, dmax):
+        """Chạy ở luồng nền; báo về giao diện qua self.api_events (cùng dạng sự kiện với Chrome)."""
+        emit, stopped = self.api_events.put, self.api_stop.is_set
+        emit(("status", "API: đang lấy quyền đăng của các trang…"))
+        try:
+            pages = {p["id"]: p for p in fbapi.list_pages(token)}
+        except Exception as e:
+            emit(("done", f"Lỗi: không dùng được token — {e}"))
+            return
+        n = len(jobs)
+        for i, (idx, pid) in enumerate(jobs):
+            if stopped():
+                break
+            emit(("status", f"API: đang đăng {i + 1}/{n}"))
+            emit(("result", idx, "run", "Đang tải lên…"))
+            try:
+                page = pages.get(pid)
+                if not page:
+                    raise fbapi.GraphError("Token này không còn quyền với Trang này")
+                post_id, note = fbapi.post_to_page(page, text, media, link, stop=stopped)
+                status, msg = "posted", f"{note} — https://www.facebook.com/{post_id}"
+            except Exception as e:
+                status = "stopped" if stopped() else "error"
+                msg = str(e).splitlines()[0][:200] if str(e) else type(e).__name__
+            emit(("result", idx, status, msg))
+            if i < n - 1 and status == "posted":
+                for s in range(random.randint(dmin, dmax), 0, -1):
+                    if stopped():
+                        break
+                    emit(("status", f"API: nghỉ {s}s trước trang tiếp theo"))
+                    time.sleep(1)
+        emit(("done", "Đã dừng" if stopped() else "Hoàn tất"))
+
+    def open_result_link(self, e):
+        iid = e.widget.identify_row(e.y)
+        m = URL_RE.search(e.widget.item(iid, "values")[2]) if iid else None
+        if m:
+            webbrowser.open(m.group(0))
 
     # ---------- Lịch sử ----------
     def render_history(self):
@@ -595,7 +916,7 @@ class App:
             first = " ".join(s["text"].split())[:90] or f"({len(s['media'])} ảnh/video)"
             self.htree.insert("", "end", iid=s["id"], values=(
                 s["start"] + ("  ⏳" if not s.get("end") else ""), first, len(s["results"]), ok, pend, bad,
-                "Tự động" if s.get("auto") else "Duyệt tay"))
+                "API" if s.get("api") else "Tự động" if s.get("auto") else "Duyệt tay"))
         if sel and self.htree.exists(sel[0]):
             self.htree.selection_set(sel[0])
 
@@ -622,6 +943,8 @@ class App:
         self.text.delete("1.0", "end")
         self.text.insert("1.0", s["text"])
         self.media = list(s["media"])
+        if s.get("api"):
+            self.api_link.set(s.get("link", ""))
         self.render_media()
         self.chars.config(text=f"{len(self.get_text())} ký tự")
         self.save()
@@ -635,7 +958,7 @@ class App:
         bad = [r for r in s["results"] if r["status"] in RETRY_STATES]
         if not bad:
             return messagebox.showinfo("Lịch sử", "Phiên này không có nơi nào bị lỗi.")
-        self.run(bad, s["text"], s["media"])
+        self.rerun(s, bad)
 
     def delete_session(self):
         s = self.selected_session()
@@ -649,43 +972,53 @@ class App:
 
     # =============================== SỰ KIỆN TỪ ENGINE ===============================
     def poll(self):
-        try:
-            while True:
-                ev = self.engine.events.get_nowait()
-                kind = ev[0]
-                if kind == "status":
-                    self.status.config(text=ev[1])
-                elif kind == "result" and self.session:
-                    _, idx, st, msg = ev
-                    if idx < len(self.session["results"]):
-                        self.session["results"][idx].update(status=st, msg=msg)
-                        self.render_results()
-                        if st != "run":
-                            self.save_history()
-                elif kind == "who":
-                    _, name, is_page, url = ev
-                    t = self.find_target(norm_url(url) or "")
-                    name = (t and t.get("name")) or name or short(url)
-                    self.who.config(text=f"Đang đăng với: {name}  ({'TRANG' if is_page else 'tài khoản cá nhân'})",
-                                    foreground="#c27c0e" if is_page else "#31a24c")
-                elif kind == "scan":
-                    self.merge_scan(ev[1], ev[2])
-                elif kind == "done":
-                    if self.session and not self.session.get("end"):
-                        for r in self.session["results"]:
-                            if r["status"] in ("queue", "run"):
-                                r.update(status="stopped", msg="Chưa chạy (đã dừng)")
-                        self.session["end"] = time.strftime("%d/%m/%Y %H:%M")
-                        self.save_history()
-                        self.render_results()
-                    self.set_busy(False)
-                    self.render_history()
-                    self.status.config(text=ev[1])
-                    if ev[1].startswith("Lỗi"):
-                        messagebox.showerror("FB Auto Poster", ev[1])
-        except queue.Empty:
-            pass
+        for q in (self.engine.events, self.api_events):
+            try:
+                while True:
+                    self.handle_event(q.get_nowait())
+            except queue.Empty:
+                pass
         self.root.after(200, self.poll)
+
+    def handle_event(self, ev):
+        kind = ev[0]
+        if kind == "status":
+            self.status.config(text=ev[1])
+        elif kind == "result" and self.session:
+            _, idx, st, msg = ev
+            if idx < len(self.session["results"]):
+                self.session["results"][idx].update(status=st, msg=msg)
+                self.render_results()
+                if st != "run":
+                    self.save_history()
+        elif kind == "who":
+            _, name, is_page, url = ev
+            t = self.find_target(norm_url(url) or "")
+            name = (t and t.get("name")) or name or short(url)
+            self.who.config(text=f"Đang đăng với: {name}  ({'TRANG' if is_page else 'tài khoản cá nhân'})",
+                            foreground="#c27c0e" if is_page else "#31a24c")
+        elif kind == "scan":
+            self.merge_scan(ev[1], ev[2])
+        elif kind == "done":
+            if self.session and not self.session.get("end"):
+                for r in self.session["results"]:
+                    if r["status"] in ("queue", "run"):
+                        r.update(status="stopped", msg="Chưa chạy (đã dừng)")
+                self.session["end"] = time.strftime("%d/%m/%Y %H:%M")
+                self.save_history()
+                self.render_results()
+            self.set_busy(False)
+            self.render_history()
+            self.status.config(text=ev[1])
+            if ev[1].startswith("Lỗi"):
+                messagebox.showerror("FB Auto Poster", ev[1])
+        elif kind == "api_scan":
+            self.api_merge_scan(ev[1], ev[2])
+        elif kind == "api_scan_error":
+            self.api_scan_btn.config(state="normal")
+            self.status.config(text="Quét trang bằng API bị lỗi")
+            messagebox.showerror("Quét trang bằng API", f"{ev[1]}\n\nToken có thể đã hết hạn hoặc thiếu quyền "
+                                 "pages_show_list / pages_manage_posts. Bấm 'Mở link lấy token' để lấy token mới.")
 
     def on_close(self):
         if self.busy and not messagebox.askyesno("Thoát", "App đang chạy. Thoát luôn?"):

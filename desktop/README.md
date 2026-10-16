@@ -1,31 +1,27 @@
-# Tab "Đăng Trang bằng API" cho FB Auto Poster
+# FB Auto Poster (bản có tab "Đăng Trang bằng API")
 
-Đăng bài lên các Trang Facebook bạn quản lý qua **Graph API chính thức**, không cần mở Chrome.
+Mã nguồn app desktop FB Auto Poster, thêm tab **🔑 Đăng Trang bằng API**: đăng lên các Trang bạn quản lý
+qua Facebook Graph API chính thức, không cần mở Chrome.
 
-## Cài đặt
-```
-pip install requests
-```
-Chép `fb_graph_api.py` và `fb_pages_tab.py` vào cùng thư mục với app FB Auto Poster.
+## Cập nhật trên máy
+Chép đè 3 file này vào `C:\Users\LENOVO\FB Auto Poster`:
+- `FB_Auto_Poster.pyw` (đã sửa)
+- `fb_graph_api.py` (mới)
+- `fb_engine.py` (giữ nguyên, để kèm cho đủ bộ)
 
-## Gắn vào app
-Ở chỗ app tạo các tab (`ttk.Notebook` có "Đăng bài", "Lịch sử phiên đăng"), thêm:
-```python
-from fb_pages_tab import PagesApiTab
+Cần thư viện `requests` (một lần): `pip install requests`. Thiếu thì tab API sẽ báo cách cài.
 
-api_tab = PagesApiTab(notebook,
-    get_content=lambda: (o_noi_dung.get("1.0", "end-1c"), danh_sach_anh_video))
-notebook.add(api_tab, text="🔑 Đăng Trang bằng API")
-```
-`get_content` là tuỳ chọn: thay `o_noi_dung` / `danh_sach_anh_video` bằng tên biến thật trong app để
-nút "Lấy nội dung từ tab Đăng bài" lấy được bài đang soạn. Chạy thử riêng: `python fb_pages_tab.py`.
+## Cách dùng tab "Đăng Trang bằng API"
+1. Bấm **🔗 Mở link lấy token** → Graph API Explorer → chọn app → *Get User Access Token* → tick
+   `pages_show_list`, `pages_read_engagement`, `pages_manage_posts` → Generate (chọn các trang) → copy token, dán vào ô.
+2. Bấm **🔍 Quét trang bằng API** → danh sách trang hiện ra, tick ☑ các trang muốn đăng.
+3. Nội dung, ảnh/video lấy chung từ tab **✍ Đăng bài**. Có thể thêm link kèm bài.
+4. Bấm **▶ ĐĂNG BẰNG API LÊN CÁC TRANG ĐÃ CHỌN**. Nút đổi thành **■ DỪNG** khi đang chạy.
 
-## Cách dùng
-1. Bấm **🔗 Mở link lấy token** → Graph API Explorer → chọn app → *Get User Access Token* →
-   tick `pages_show_list`, `pages_read_engagement`, `pages_manage_posts` → Generate (chọn các trang) → copy token.
-2. Dán token, bấm **🔍 Quét trang bằng API** → hiện danh sách trang.
-3. Soạn nội dung / thêm ảnh, video → tick trang → **▶ ĐĂNG BẰNG API**.
+Kết quả lưu vào **Lịch sử phiên đăng** (cột Chế độ = "API"); "Chạy lại các nơi lỗi" của phiên API sẽ chạy lại bằng API.
+Bấm đúp vào dòng kết quả để mở bài vừa đăng.
 
-Lưu ý: token từ Explorer chỉ sống ~1–2 giờ. Dùng nút **Kiểm tra / gia hạn token**
-(Access Token Debugger → *Extend Access Token*) để có token ~60 ngày.
-Token được lưu (nếu tick "Nhớ token") tại `%USERPROFILE%\.fb_auto_poster_api.json`.
+Lưu ý:
+- Token từ Explorer chỉ sống ~1–2 giờ: bấm **Kiểm tra / gia hạn token** → *Extend Access Token* để dùng ~60 ngày.
+- Nhiều ảnh → 1 bài album. Có video → đăng 1 video/bài (API không cho trộn ảnh + video); video tải theo từng phần nên file lớn vẫn được.
+- Token (nếu tick "Nhớ token") và danh sách trang lưu trong `data\config.json`.
